@@ -1,1 +1,1 @@
-My handcoded version of vl_nanochat
+My handcoded version of nanochat
