@@ -35,7 +35,18 @@ class GPTConfig:
 
 def norm(x):
     # Purely functional rmsnorm with no learnable params
-    return F.rms_norm(x, (x.size(-1),))
+    # Use PyTorch's built-in rms_norm if available (PyTorch 2.3.0+), otherwise implement manually
+    if hasattr(F, 'rms_norm'):
+        return F.rms_norm(x, (x.size(-1),))
+    else:
+        # Fallback implementation for older PyTorch versions
+        # RMSNorm: x / sqrt(mean(x^2) + eps)
+        eps = 1e-6
+        norm_dim = x.size(-1)
+        x_float = x.float()
+        variance = x_float.pow(2).mean(dim=-1, keepdim=True)
+        x_normed = x_float / torch.sqrt(variance + eps)
+        return x_normed.to(x.dtype)
 
 
 def apply_rotary_emb(x, cos, sin):
@@ -85,14 +96,38 @@ class CausalSelfAttention(nn.Module):
 
         # Attention: queries attend to keys/values autoregressively. A few cases to handle:
         enable_gqa = self.n_head != self.n_kv_head # Group Query Attention (GQA): duplicate key/value heads to match query heads if desired
+        # Handle GQA manually for older PyTorch versions that don't support enable_gqa parameter
+        if enable_gqa:
+            # Duplicate key/value heads to match query heads
+            # k, v shape: (B, n_kv_head, T, D), need to expand to (B, n_head, T, D)
+            kv_repeat = self.n_head // self.n_kv_head
+            k = k.repeat_interleave(kv_repeat, dim=1)
+            v = v.repeat_interleave(kv_repeat, dim=1)
+        
+        # For older PyTorch versions, don't pass enable_gqa parameter
+        # Only pass it if GQA is actually enabled and PyTorch supports it
+        # We'll use try-except to handle gracefully
+        def call_attention(q, k, v, **kwargs):
+            """Helper to call scaled_dot_product_attention with optional enable_gqa"""
+            if enable_gqa:
+                # Try with enable_gqa first
+                try:
+                    return F.scaled_dot_product_attention(q, k, v, enable_gqa=True, **kwargs)
+                except TypeError:
+                    # Fallback: GQA already handled manually above, so just call normally
+                    return F.scaled_dot_product_attention(q, k, v, **kwargs)
+            else:
+                # No GQA, don't pass the parameter
+                return F.scaled_dot_product_attention(q, k, v, **kwargs)
+        
         if kv_cache is None or Tq == Tk:
             # During training (no KV cache), attend as usual with causal attention
             # And even if there is KV cache, we can still use this simple version when Tq == Tk
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
+            y = call_attention(q, k, v, is_causal=True)
         elif Tq == 1:
             # During inference but with a single query in this forward pass:
             # The query has to attend to all the keys/values in the cache
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
+            y = call_attention(q, k, v, is_causal=False)
         else:
             # During inference AND we have a chunk of queries in this forward pass:
             # First, each query attends to all the cached keys/values (i.e. full prefix)
@@ -101,7 +136,7 @@ class CausalSelfAttention(nn.Module):
             attn_mask[:, :prefix_len] = True
             # Then, causal attention within this chunk
             attn_mask[:, prefix_len:] = torch.tril(torch.ones((Tq, Tq), dtype=torch.bool, device=q.device))
-            y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=enable_gqa)
+            y = call_attention(q, k, v, attn_mask=attn_mask)
 
         # Re-assemble the heads side by side and project back to residual stream
         y = y.transpose(1, 2).contiguous().view(B, T, -1)

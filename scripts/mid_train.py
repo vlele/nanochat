@@ -47,6 +47,7 @@ weight_decay = 0.0
 eval_every = 150 # -1 = disable
 eval_tokens = 20*524288
 total_batch_size = 524288
+save_every = 100 # save checkpoint every N steps (0 = only at end, -1 = disable)
 dry_run = 0 # dry_run=1 is for experiments: we will log to wandb but we won't write checkpoints or report
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open(os.path.join('nanochat', 'configurator.py')).read()) # overrides from command line or config file
@@ -71,7 +72,7 @@ pretrain_batch_size = meta.get("device_batch_size", None)
 if pretrain_batch_size is not None and device_batch_size > pretrain_batch_size:
     print0(f"FOOTGUN WARNING: base model training used device_batch_size {pretrain_batch_size}, did you pass in a good --device_batch_size to this script?")
 orig_model = model
-model = torch.compile(model, dynamic=False)
+# model = torch.compile(model, dynamic=False)  # Disabled for 8GB GPU - too slow
 depth = model.config.n_layer
 num_flops_per_token = model.estimate_flops()
 tokens_per_fwdbwd = device_batch_size * max_seq_len # tokens per iteration for a single rank
@@ -120,12 +121,14 @@ def mid_data_generator(split):
     dataset = train_dataset if split == "train" else val_dataset
     dataset_size = len(dataset)
     assert dataset_size > 0
+    if split == "train":
+        print0(f"Midtraining dataset size: {dataset_size:,} examples")
     needed_tokens = device_batch_size * max_seq_len + 1 # to form one training batch of inputs,targets
     token_buffer = deque()
     # CUDA supports memory pinning for faster transfers between CPU and GPU:
     scratch = torch.empty(needed_tokens, dtype=torch.int64, pin_memory=(device_type == "cuda"))
     cursor = ddp_rank # increments by ddp_world_size each time, so each rank processes unique documents
-    it = 0 # iteration counter
+    it = 0 # iteration counter (counts gradient accumulation micro-steps, not training steps)
     while True:
         # Accumulate enough tokens for one iteration before yielding
         while len(token_buffer) < needed_tokens:
@@ -135,11 +138,18 @@ def mid_data_generator(split):
             cursor += ddp_world_size
             if cursor >= dataset_size:
                 cursor -= dataset_size # wrap around for another epoch
-                if split == "train":
+                if split == "train" and num_iterations <= 0:
+                    # Only stop on wrap-around if num_iterations is not set (full epoch training)
+                    print0(f"Dataset wrapped around at cursor={cursor}, stopping (num_iterations={num_iterations})")
                     last_step = True # toggle last_step to True, which will terminate the training loop
+                elif split == "train":
+                    print0(f"Dataset wrapped around at cursor={cursor}, continuing (num_iterations={num_iterations})")
         # Stopping condition to respect num_iterations, if given
+        # Note: it counts gradient accumulation micro-steps, so we need to multiply num_iterations by grad_accum_steps
         it += 1
-        if 0 < num_iterations <= it and split == "train":
+        training_steps = it // grad_accum_steps
+        if num_iterations > 0 and training_steps >= num_iterations and split == "train":
+            print0(f"Stopping at training step {training_steps} (iteration {it}, reached num_iterations={num_iterations})")
             last_step = True # toggle last_step to True, which will terminate the training loop
         # Build up inputs/targets and yield
         for i in range(needed_tokens):
@@ -150,7 +160,9 @@ def mid_data_generator(split):
         targets = targets_cpu.view(device_batch_size, max_seq_len).to(device=device, dtype=torch.int64, non_blocking=True)
         if split == "train":
             if num_iterations > 0:
-                approx_progress = it / num_iterations # calculate progress from the max number of iterations
+                # it counts micro-steps, so convert to training steps for progress
+                training_steps = it // grad_accum_steps
+                approx_progress = training_steps / num_iterations # calculate progress from the max number of iterations
             else:
                 approx_progress = cursor / dataset_size # approximate progress as a fraction of the dataset
         yield inputs, targets
@@ -174,6 +186,7 @@ def get_muon_momentum(it):
 # Training loop
 x, y = next(train_loader) # prefetch the very first batch of data
 min_val_bpb = float("inf")
+val_bpb = None # will be set during evaluation if eval_every > 0
 smooth_train_loss = 0 # EMA of training loss
 ema_beta = 0.9 # EMA decay factor
 total_training_time = 0 # total wall-clock time of training
@@ -205,8 +218,8 @@ while True:
         })
         model.train()
 
-    # save checkpoint at the end of the run (only on master process)
-    if master_process and last_step and not dry_run:
+    # save checkpoint: at the end of the run, or every save_every steps
+    if master_process and not dry_run and (last_step or (save_every > 0 and step > 0 and step % save_every == 0)):
         output_dirname = f"d{depth}" # e.g. d12
         checkpoint_dir = os.path.join(base_dir, "mid_checkpoints", output_dirname)
         save_checkpoint(
@@ -216,7 +229,7 @@ while True:
             [opt.state_dict() for opt in optimizers], # TODO: make sure saving across ranks is done correctly
             {
                 "step": step,
-                "val_bpb": val_bpb, # loss at last step
+                "val_bpb": val_bpb if val_bpb is not None else float("inf"), # loss at last step (None if eval disabled)
                 "model_config": {
                     "sequence_len": max_seq_len,
                     "vocab_size": tokenizer.get_vocab_size(),
@@ -228,6 +241,7 @@ while True:
                 "user_config": user_config, # inputs to the training script
             }
         )
+        print0(f"✅ Saved checkpoint at step {step} to {checkpoint_dir}")
 
     if last_step:
         break

@@ -41,6 +41,7 @@ step = None # step to load the model from (base model or midtrained model)
 device_type = "" # cuda|cpu|mps (empty => autodetect)
 dtype = "bfloat16"
 device_batch_size = 4 # max to avoid OOM
+max_tokens = 2048 # max tokens per conversation (truncated if longer)
 # optimization
 num_epochs = 1
 num_iterations = -1 # override number of iterations (-1 = disable, use num_epochs to derive it)
@@ -55,6 +56,7 @@ eval_every = 100
 eval_steps = 100
 eval_metrics_every = 200
 eval_metrics_max_problems = 1024
+save_every = 100 # save checkpoint every N steps (0 = only at end, -1 = disable)
 # now allow CLI to override the settings via the configurator lol
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open(os.path.join('nanochat', 'configurator.py')).read()) # overrides from command line or config file
@@ -121,7 +123,7 @@ def sft_data_generator(dataset, batch_size):
     while True:
         for i in range(ddp_rank, len(dataset), ddp_world_size):
             doc = dataset[i]
-            ids, mask = tokenizer.render_conversation(doc)
+            ids, mask = tokenizer.render_conversation(doc, max_tokens=max_tokens)
             batch.append((ids, mask))
             if len(batch) == batch_size:
                 yield collate_and_yield(batch)
@@ -167,6 +169,8 @@ def get_lr_multiplier(it):
 
 # Go!
 step = 0
+val_loss = None  # Initialize for checkpoint saving
+metrics = {}  # Initialize for checkpoint saving
 for step in range(num_iterations):
     last_step = step == num_iterations - 1
 
@@ -206,6 +210,32 @@ for step in range(num_iterations):
             **metrics,
         })
         model.train()
+
+    # save checkpoint: at the end of the run, or every save_every steps
+    if master_process and (last_step or (save_every > 0 and step > 0 and step % save_every == 0)):
+        base_dir = get_base_dir()
+        depth = model.config.n_layer
+        model_tag = f"d{depth}"
+        checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", model_tag)
+        model_config_kwargs = model.config.__dict__
+        checkpoint_meta = {
+            "step": step,
+            "model_config": model_config_kwargs,
+        }
+        # Add val_loss if it exists
+        if 'val_loss' in locals() and val_loss is not None:
+            checkpoint_meta["val_loss"] = val_loss
+        # Add metrics if they exist
+        if 'metrics' in locals() and metrics:
+            checkpoint_meta.update(metrics)
+        save_checkpoint(
+            checkpoint_dir,
+            step,
+            model.state_dict(),
+            None, # note: we don't bother to save the optimizer state
+            checkpoint_meta
+        )
+        print0(f"✅ Saved checkpoint at step {step} to {checkpoint_dir}")
 
     if last_step:
         break
@@ -253,17 +283,20 @@ if master_process:
     model_tag = f"d{depth}" # base the model tag on the depth of the base model
     checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", model_tag)
     model_config_kwargs = model.config.__dict__ # slightly naughty, abusing the simplicity of GPTConfig, TODO nicer
+    checkpoint_meta = {
+        "step": step,
+        "model_config": model_config_kwargs,
+    }
+    if val_loss is not None:
+        checkpoint_meta["val_loss"] = val_loss
+    if metrics:
+        checkpoint_meta.update(metrics)
     save_checkpoint(
         checkpoint_dir,
         step,
         model.state_dict(),
         None, # note: we don't bother to save the optimizer state
-        {
-            "step": step,
-            "val_loss": val_loss,
-            **metrics,
-            "model_config": model_config_kwargs,
-        }
+        checkpoint_meta
     )
     print(f"✅ Saved model checkpoint to {checkpoint_dir}")
 
